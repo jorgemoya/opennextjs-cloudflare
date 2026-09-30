@@ -19,7 +19,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { builtinModules, isBuiltin } from "node:module";
+import { builtinModules, createRequire, isBuiltin } from "node:module";
 import path from "node:path";
 
 import { type BuildOptions, getBundlerRuntime, getPackagePath } from "@opennextjs/aws/build/helper.js";
@@ -106,6 +106,32 @@ export function setCompiledMiddlewarePlugin(compiledMiddlewarePath: string): Plu
 }
 
 /**
+ * Resolves `@opentelemetry/api` to the entry point that Node.js `require()` loads.
+ *
+ * `copyTracedFiles` only copies the files listed in the Next.js trace, which records the CommonJS
+ * build of the package (`main`). This bundle prefers the `module` entry, pointing to an ESM build
+ * that was never copied, so an app that installs `@opentelemetry/api` failed to build with
+ * `Could not resolve "@opentelemetry/api"`. Resolving from the importer the way `require()` does lands
+ * on the traced copy.
+ *
+ * When the package can not be resolved that way, esbuild's default resolution is used.
+ */
+export function opentelemetryApiPlugin(): Plugin {
+	return {
+		name: "opentelemetry-api",
+		setup(build) {
+			build.onResolve({ filter: /^@opentelemetry\/api$/ }, ({ path: specifier, resolveDir }) => {
+				try {
+					return { path: createRequire(path.join(resolveDir, "noop.js")).resolve(specifier) };
+				} catch {
+					return undefined;
+				}
+			});
+		},
+	};
+}
+
+/**
  * Makes the Node.js builtins used by the bundled code (i.e. `require("crypto")` or
  * `import from "node:crypto"`) resolve to the modules workerd provides via `nodejs_compat`.
  *
@@ -183,7 +209,8 @@ export async function bundleNodeMiddleware(options: BuildOptions): Promise<void>
 	// `next/dist/server/lib/trace/tracer.js` requires `@opentelemetry/api`, an optional
 	// dependency that most apps do not install. On the edge runtime Next.js does not fall
 	// back to its compiled copy when the require throws, so alias to that copy - but only
-	// when the app has not installed the real package, otherwise the real one is used.
+	// when the app has not installed the real package, otherwise the real one is used
+	// (see `opentelemetryApiPlugin`).
 	const hasOpentelemetry = existsSync(
 		path.join(options.appBuildOutputPath, "node_modules", "@opentelemetry", "api")
 	);
@@ -244,6 +271,7 @@ export async function bundleNodeMiddleware(options: BuildOptions): Promise<void>
 				path.join(options.openNextDistDir, "core", "nodeMiddlewareHandler.js")
 			),
 			setCompiledMiddlewarePlugin(compiledMiddleware),
+			...(hasOpentelemetry ? [opentelemetryApiPlugin()] : []),
 			// `.wasm` and `.bin` files are bundled by wrangler, not by this build
 			setWranglerExternal(),
 			// Must be registered before `openNextEdgePlugins` to handle `require("node:*")` calls

@@ -1,10 +1,13 @@
 import { execFile } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
 
 import { build, type BuildOptions } from "esbuild";
-import { describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
-import { nodeBuiltinsPlugin } from "./bundle-node-middleware.js";
+import { nodeBuiltinsPlugin, opentelemetryApiPlugin } from "./bundle-node-middleware.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -156,5 +159,72 @@ describe("nodeBuiltinsPlugin", () => {
 		`);
 
 		expect(uuid).toMatch(/^[0-9a-f-]{36}$/);
+	});
+});
+
+describe("opentelemetryApiPlugin", () => {
+	let dir: string;
+
+	// Mirrors what `copyTracedFiles` copies: the Next.js trace only records the CommonJS build, so
+	// the ESM build that the `module` entry points to is missing.
+	beforeEach(() => {
+		dir = mkdtempSync(path.join(tmpdir(), "otel-api-"));
+		const pkgDir = path.join(dir, "node_modules/@opentelemetry/api");
+		mkdirSync(path.join(pkgDir, "build/src"), { recursive: true });
+		writeFileSync(
+			path.join(pkgDir, "package.json"),
+			JSON.stringify({
+				name: "@opentelemetry/api",
+				main: "build/src/index.js",
+				module: "build/esm/index.js",
+				exports: {
+					".": {
+						module: "./build/esm/index.js",
+						default: "./build/src/index.js",
+					},
+				},
+			})
+		);
+		writeFileSync(path.join(pkgDir, "build/src/index.js"), `module.exports = { build: "cjs" };`);
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	/**
+	 * Bundles `contents` from `dir` with the resolution options `bundleNodeMiddleware` uses.
+	 *
+	 * @param contents Source of the entry point.
+	 * @param plugins The esbuild plugins.
+	 * @returns The bundled output.
+	 */
+	function bundleFromFixture(contents: string, plugins: BuildOptions["plugins"]): Promise<string> {
+		return bundle(contents, {
+			stdin: { contents, loader: "js", resolveDir: dir },
+			conditions: ["module"],
+			mainFields: ["module", "main"],
+			plugins,
+		});
+	}
+
+	test("the `module` entry of the traced copy does not resolve", async () => {
+		await expect(bundleFromFixture(`require("@opentelemetry/api");`, [])).rejects.toThrow(
+			/Could not resolve "@opentelemetry\/api"/
+		);
+	});
+
+	test("resolves to the traced CommonJS build", async () => {
+		const code = await bundleFromFixture(`module.exports = require("@opentelemetry/api").build;`, [
+			opentelemetryApiPlugin(),
+		]);
+
+		expect(
+			await runInNode(
+				code,
+				`const { default: value } = await import(process.env.BUNDLE_URL);
+				process.stdout.write(JSON.stringify(value));`
+			)
+		).toBe("cjs");
 	});
 });
